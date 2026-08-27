@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""Compile and run local coding-challenge tests in a disposable directory."""
+"""Compile and run local coding-challenge tests in a disposable directory.
+
+Design philosophy:
+- Zero external dependencies: uses Python standard library only.
+- Deterministic and isolated: runs tests in an ephemeral temporary directory.
+- Multi-language support: Python, TypeScript, Java, and Kotlin.
+- Resource bounded: enforces CPU time, process lifetime, memory limits, and file sizes.
+- Non-leaking output: sanitizes ephemeral workspace paths and ANSI escape codes.
+
+Note on Security:
+This runner provides basic resource containment (timeouts, file size limits, memory limits)
+to guard against accidental infinite loops and memory exhaustion. It is NOT a full sandbox
+against malicious code (e.g., untrusted network access or syscalls).
+"""
 
 from __future__ import annotations
 
@@ -14,20 +27,25 @@ import sys
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 
-LANGUAGES = {
+# Supported language toolchains and file extensions.
+LANGUAGES: dict[str, dict[str, set[str] | tuple[str, ...]]] = {
     "python": {"extensions": {".py"}, "tools": ("python3",)},
     "typescript": {"extensions": {".ts"}, "tools": ("node", "tsc")},
     "java": {"extensions": {".java"}, "tools": ("java", "javac")},
     "kotlin": {"extensions": {".kt"}, "tools": ("java", "kotlinc")},
 }
-ALIASES = {"py": "python", "ts": "typescript", "kt": "kotlin"}
+
+# Accepted CLI aliases for user convenience.
+ALIASES: dict[str, str] = {"py": "python", "ts": "typescript", "kt": "kotlin"}
 
 
 @dataclass
 class Result:
+    """Standardized execution result returned by all runner phases."""
+
     status: str
     phase: str
     returncode: int | None
@@ -36,6 +54,7 @@ class Result:
 
 
 def normalize_language(value: str) -> str:
+    """Validate and normalize a user-provided language name or alias."""
     language = ALIASES.get(value.lower(), value.lower())
     if language not in LANGUAGES:
         raise argparse.ArgumentTypeError(f"unsupported language: {value}")
@@ -43,16 +62,24 @@ def normalize_language(value: str) -> str:
 
 
 def find_tool(name: str) -> str | None:
+    """Locate an executable binary on system PATH."""
     return shutil.which(name)
 
 
 def clean_environment(workspace: Path) -> dict[str, str]:
-    env = {
+    """Construct an isolated environment dictionary for child processes.
+
+    Restricts environment variables to prevent accidental host pollution or dependency
+    leakage while keeping minimal system variables required for process startup.
+    """
+    env: dict[str, str] = {
         "PATH": os.environ.get("PATH", ""),
         "HOME": str(workspace),
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
+        # Deterministic hashing for Python to keep dict/set ordering predictable
         "PYTHONHASHSEED": "0",
+        # Do not write .pyc bytecode files inside the disposable workspace
         "PYTHONDONTWRITEBYTECODE": "1",
     }
     if os.name == "nt":
@@ -62,7 +89,21 @@ def clean_environment(workspace: Path) -> dict[str, str]:
     return env
 
 
-def resource_limiter(timeout: int, memory_mb: int, limit_address_space: bool):
+def resource_limiter(
+    timeout: int, memory_mb: int, limit_address_space: bool
+) -> Callable[[], None] | None:
+    """Create a preexec hook for POSIX systems enforcing resource constraints via setrlimit.
+
+    Limits enforced:
+    - RLIMIT_CPU: Hard CPU timeout stopping runaway CPU-bound loops.
+    - RLIMIT_AS: Virtual address space limit (enabled for Python only).
+      * Note on Node.js / JVM: V8 and the JVM pre-allocate large virtual address
+        spaces (multiple GBs) upon startup. Applying RLIMIT_AS causes immediate mmap
+        failures. For TypeScript and Java/Kotlin, heap limits are enforced via
+        --max-old-space-size and -Xmx instead of RLIMIT_AS.
+    - RLIMIT_FSIZE: Caps output file sizes to 16 MB to prevent disk fill attacks.
+    - RLIMIT_NOFILE: Caps file descriptors to 64 to prevent descriptor exhaustion.
+    """
     if os.name != "posix":
         return None
     try:
@@ -72,6 +113,7 @@ def resource_limiter(timeout: int, memory_mb: int, limit_address_space: bool):
 
     def limit() -> None:
         try:
+            # Create a new process group session so child processes can be terminated together.
             os.setsid()
         except OSError:
             pass
@@ -86,6 +128,7 @@ def resource_limiter(timeout: int, memory_mb: int, limit_address_space: bool):
             except (OSError, ValueError):
                 pass
 
+        # CPU timeout: soft limit triggers SIGXCPU, hard limit terminates with SIGKILL
         apply(resource.RLIMIT_CPU, timeout, timeout + 1)
         if limit_address_space:
             memory_bytes = memory_mb * 1024 * 1024
@@ -96,6 +139,21 @@ def resource_limiter(timeout: int, memory_mb: int, limit_address_space: bool):
     return limit
 
 
+def _safe_kill_process(proc: subprocess.Popen[str]) -> None:
+    """Safely terminate a process and its process group without unhandled race conditions."""
+    if os.name == "posix":
+        try:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGKILL)
+            return
+        except OSError:
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
 def run_process(
     command: Sequence[str],
     workspace: Path,
@@ -104,6 +162,7 @@ def run_process(
     apply_limits: bool,
     limit_address_space: bool = False,
 ) -> Result:
+    """Execute a command in the workspace directory with timeout and resource limits."""
     preexec = (
         resource_limiter(timeout, memory_mb, limit_address_space)
         if apply_limits
@@ -122,16 +181,10 @@ def run_process(
         try:
             stdout, stderr = proc.communicate(timeout=timeout + 1)
         except subprocess.TimeoutExpired:
-            if os.name == "posix":
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except OSError:
-                    proc.kill()
-            else:
-                proc.kill()
+            _safe_kill_process(proc)
             try:
                 stdout, stderr = proc.communicate(timeout=1)
-            except (subprocess.TimeoutExpired, ValueError):
+            except (subprocess.TimeoutExpired, ValueError, OSError):
                 stdout, stderr = "", ""
             return Result(
                 status="timeout",
@@ -141,14 +194,11 @@ def run_process(
                 stderr=stderr or f"Timed out after {timeout} seconds",
             )
         except Exception:
-            if os.name == "posix":
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except OSError:
-                    proc.kill()
-            else:
-                proc.kill()
-            proc.wait()
+            _safe_kill_process(proc)
+            try:
+                proc.wait(timeout=1)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
             raise
     except OSError as exc:
         return Result(status="error", phase="run", returncode=None, stdout="", stderr=str(exc))
@@ -167,6 +217,7 @@ def run_process(
 
 
 def compile_sources(command: Sequence[str], workspace: Path, timeout: int) -> Result:
+    """Compile statically-typed source files prior to execution."""
     result = run_process(command, workspace, timeout, 2048, apply_limits=False)
     result.phase = "compile"
     if result.status == "passed":
@@ -175,6 +226,7 @@ def compile_sources(command: Sequence[str], workspace: Path, timeout: int) -> Re
 
 
 def copy_sources(paths: Sequence[Path], workspace: Path, extensions: set[str]) -> list[Path]:
+    """Copy given source and test files into the disposable workspace root."""
     copied: list[Path] = []
     names: set[str] = set()
     for source in paths:
@@ -200,8 +252,17 @@ def build_commands(
     memory_mb: int,
     workspace: Path,
 ) -> tuple[list[str] | None, list[str], bool]:
+    """Build compilation and execution command lists per language.
+
+    Returns:
+        (compile_command, run_command, limit_address_space_flag)
+    """
     names = [path.name for path in files]
+
     if language == "python":
+        # Python isolation:
+        # -I: Isolated mode (ignores PYTHONPATH and PYTHONHOME, disables user site-packages)
+        # -B: Prevents writing .pyc files
         bootstrap = (
             "import runpy,sys; "
             "sys.path.insert(0, '.'); "
@@ -231,6 +292,9 @@ def build_commands(
             str(build),
             *names,
         ]
+        # Node hardening:
+        # --disable-proto=throw: mitigates prototype mutation security issues
+        # --max-old-space-size: caps V8 heap allocation
         run_command = [
             node,
             "--disable-proto=throw",
@@ -245,7 +309,7 @@ def build_commands(
         if not javac or not java:
             raise SystemExit("Java runner requires both javac and java on PATH")
         build = workspace / "build"
-        build.mkdir()
+        build.mkdir(exist_ok=True)
         class_name = entry or test_file.stem
         return (
             [javac, "-encoding", "UTF-8", "-d", str(build), *names],
@@ -265,14 +329,17 @@ def build_commands(
     )
 
 
+# Pattern matching ANSI escape sequences (colors, cursor movements)
 ANSI_PATTERN = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
 
 def strip_ansi(text: str) -> str:
+    """Remove terminal ANSI escape codes from output strings."""
     return ANSI_PATTERN.sub("", text)
 
 
 def sanitize(result: Result, workspace: Path) -> Result:
+    """Scrub absolute workspace paths and terminal ANSI codes from output."""
     marker = str(workspace)
     result.stdout = strip_ansi(result.stdout.replace(marker, "<workspace>"))
     result.stderr = strip_ansi(result.stderr.replace(marker, "<workspace>"))
@@ -280,6 +347,7 @@ def sanitize(result: Result, workspace: Path) -> Result:
 
 
 def emit(result: Result, as_json: bool) -> None:
+    """Print the execution result in human-readable or JSON format."""
     if as_json:
         print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
         return
@@ -293,6 +361,7 @@ def emit(result: Result, as_json: bool) -> None:
 
 
 def cmd_doctor(_: argparse.Namespace) -> None:
+    """Check and display the availability of required language toolchains."""
     for language, config in LANGUAGES.items():
         tools = (
             {"python": sys.executable}
@@ -305,6 +374,7 @@ def cmd_doctor(_: argparse.Namespace) -> None:
 
 
 def cmd_run(args: argparse.Namespace) -> None:
+    """Compile and execute a test file in an isolated temporary directory."""
     if not 1 <= args.timeout <= 60:
         raise SystemExit("--timeout must be between 1 and 60 seconds")
     if not 64 <= args.memory_mb <= 4096:
@@ -349,6 +419,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the command-line argument parser."""
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     doctor = subparsers.add_parser("doctor", help="show available language toolchains")
@@ -368,6 +439,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """Entry point for runner CLI."""
     args = build_parser().parse_args()
     args.func(args)
 

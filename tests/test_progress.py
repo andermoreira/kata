@@ -289,6 +289,22 @@ class StateMigrationTest(unittest.TestCase):
             progress.load_state(self.state)
         self.assertIn("Session must be an object", str(caught.exception))
 
+    def test_non_dict_root_fails_cleanly(self) -> None:
+        self.state.write_text("[]", encoding="utf-8")
+        with self.assertRaises(SystemExit) as caught:
+            progress.load_state(self.state)
+        self.assertIn("root must be a JSON object", str(caught.exception))
+
+    def test_atomic_save_persists_state_and_cleans_temporary_files(self) -> None:
+        state_data = progress.empty_state()
+        state_data["sessions"].append({"topic": "test", "concept_id": "test"})
+        progress.save_state(self.state, state_data)
+        loaded = progress.load_state(self.state)
+        self.assertEqual(len(loaded["sessions"]), 1)
+        # Ensure no leftover temporary files in directory
+        temp_files = list(self.state.parent.glob("*.tmp.*"))
+        self.assertEqual(len(temp_files), 0)
+
     def test_v3_transfer_score_gains_an_explicit_unaided_policy(self) -> None:
         self.write(
             {

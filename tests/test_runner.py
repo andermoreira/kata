@@ -98,6 +98,20 @@ class PythonRunnerTest(unittest.TestCase):
         self.assertIn("status=timeout", result.stdout)
 
 
+    def test_support_files_are_copied_and_accessible(self) -> None:
+        support_file = self.root / "helper.py"
+        support_file.write_text("HELPER_VALUE = 42\n", encoding="utf-8")
+        test_source = (
+            "from solution import allocate\n"
+            "from helper import HELPER_VALUE\n"
+            "assert HELPER_VALUE == 42\n"
+            "assert allocate(10, 2) == [5, 5]\n"
+        )
+        result = self.run_challenge(test_source, "--support", str(support_file))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("status=passed", result.stdout)
+
+
 class ArgumentValidationTest(unittest.TestCase):
     def run_runner(self, *argv: str) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -125,6 +139,34 @@ class ArgumentValidationTest(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--timeout must be between 1 and 60", result.stderr)
+
+    def test_memory_outside_bounds_is_rejected(self) -> None:
+        result = self.run_runner(
+            "run",
+            "--language",
+            "python",
+            "--solution",
+            "s.py",
+            "--tests",
+            "t.py",
+            "--memory-mb",
+            "16",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--memory-mb must be between 64 and 4096", result.stderr)
+
+    def test_missing_source_file_is_rejected(self) -> None:
+        result = self.run_runner(
+            "run",
+            "--language",
+            "python",
+            "--solution",
+            "nonexistent_solution.py",
+            "--tests",
+            "t.py",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Source file not found", result.stderr)
 
     def test_doctor_reports_every_language(self) -> None:
         result = self.run_runner("doctor")

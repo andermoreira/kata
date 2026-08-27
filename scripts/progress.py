@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
-"""Track solution-free practice metadata with deterministic adaptive reviews."""
+"""Track solution-free practice metadata with deterministic adaptive reviews.
+
+Design and Integrity Guardrails:
+- Solution-Free Diary: Tracks metadata, recall scores, calibration labels, and timings only.
+  Never stores proprietary source code, task answers, or solutions.
+- Spaced Repetition Heuristic: Implements an adaptive review interval algorithm.
+  Penalizes overconfidence ('confident_wrong') and accounts for difficulty and uncertainty.
+- Atomic Persistence: Writes state files atomically to eliminate partial-write corruption.
+- Cross-Field Integrity: Enforces semantic consistency rules from rubric.md and
+  assistance-policy.md (e.g. forbidding independent labels after hints or wrong initial answers).
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
 import math
+import os
 import re
 import statistics
 from datetime import date, datetime, timedelta
@@ -13,7 +24,10 @@ from pathlib import Path
 from typing import Any
 
 
+# Current state schema version.
 SCHEMA_VERSION = 4
+
+# Domain taxonomies and allowed values.
 VALID_OUTCOMES = {
     "independent",
     "lightly_assisted",
@@ -31,6 +45,7 @@ VALID_CAPABILITIES = {
     "ai_code_review",
     "algorithms_data",
 }
+
 # "immediate_transfer" is readable in legacy state but is no longer a session phase:
 # the transfer task happens inside a session, so its score is a session field.
 VALID_PHASES = {
@@ -42,6 +57,7 @@ VALID_PHASES = {
     "final",
 }
 RECORDABLE_PHASES = VALID_PHASES - {"immediate_transfer"}
+
 VALID_ASSISTANCE = {
     "strict_unaided",
     "standard_unaided",
@@ -50,6 +66,7 @@ VALID_ASSISTANCE = {
 }
 VALID_EVALUATORS = {"coach"}
 VALID_EVALUATOR_CONTEXTS = {"coaching"}
+
 # Legacy files may still contain these labels; they are readable, not recordable.
 LEGACY_EVALUATORS = {"coach", "independent"}
 LEGACY_EVALUATOR_CONTEXTS = {"coaching", "isolated"}
@@ -71,10 +88,12 @@ HINT_RANGE_BY_OUTCOME = {
 
 
 def empty_state() -> dict[str, Any]:
+    """Return an empty state dictionary for a newly initialized progress log."""
     return {"schema_version": SCHEMA_VERSION, "program": None, "sessions": [], "cards": []}
 
 
 def require_iso_date(value: object, field: str) -> date:
+    """Parse and validate an ISO 8601 date string (YYYY-MM-DD), failing cleanly on error."""
     try:
         return date.fromisoformat(str(value))
     except (TypeError, ValueError) as exc:
@@ -82,6 +101,7 @@ def require_iso_date(value: object, field: str) -> date:
 
 
 def normalize_session(session: Any) -> dict[str, Any]:
+    """Fill backward-compatible default fields on historical session records."""
     if not isinstance(session, dict):
         raise SystemExit(f"Session must be an object, not {type(session).__name__}")
     normalized = dict(session)
@@ -129,11 +149,13 @@ def normalize_card(card: Any) -> dict[str, Any]:
 
 
 def slugify(value: str) -> str:
+    """Convert a human topic name into a URL/CLI safe concept slug identifier."""
     slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     return slug or "concept"
 
 
 def parse_day(value: str) -> date:
+    """Argument parser helper for date CLI parameters."""
     try:
         return date.fromisoformat(value)
     except ValueError as exc:
@@ -141,6 +163,7 @@ def parse_day(value: str) -> date:
 
 
 def migrate_v1(data: dict[str, Any]) -> dict[str, Any]:
+    """Migrate schema v1 state (embedded reviews inside sessions) to card-based v4."""
     migrated = empty_state()
     migrated["sessions"] = list(data.get("sessions", []))
     seen: set[str] = set()
@@ -178,6 +201,7 @@ def migrate_v1(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def migrate_v2(data: dict[str, Any]) -> dict[str, Any]:
+    """Migrate schema v2 state to v4."""
     migrated = empty_state()
     migrated["sessions"] = list(data.get("sessions", []))
     migrated["cards"] = data.get("cards", [])
@@ -185,6 +209,7 @@ def migrate_v2(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def migrate_v3(data: dict[str, Any]) -> dict[str, Any]:
+    """Migrate schema v3 state to v4."""
     migrated = empty_state()
     migrated["program"] = data.get("program")
     migrated["sessions"] = list(data.get("sessions", []))
@@ -193,6 +218,11 @@ def migrate_v3(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_state(path: Path, allow_missing: bool = False) -> dict[str, Any]:
+    """Load and migrate progress state JSON from disk.
+
+    Validates that the file exists, contains valid JSON, has a dictionary root,
+    and applies versioned schema migrations if necessary.
+    """
     if not path.exists():
         if allow_missing:
             return empty_state()
@@ -201,6 +231,10 @@ def load_state(path: Path, allow_missing: bool = False) -> dict[str, Any]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise SystemExit(f"Could not read valid JSON from {path}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise SystemExit(f"Invalid state structure in {path}: root must be a JSON object")
+
     if data.get("schema_version") == 1 and isinstance(data.get("sessions"), list):
         data = migrate_v1(data)
     elif data.get("schema_version") == 2 and isinstance(data.get("sessions"), list):
@@ -209,8 +243,10 @@ def load_state(path: Path, allow_missing: bool = False) -> dict[str, Any]:
         data = migrate_v3(data)
     elif data.get("schema_version") != SCHEMA_VERSION:
         raise SystemExit(f"Unsupported state schema in {path}")
+
     if not isinstance(data.get("sessions"), list) or not isinstance(data.get("cards"), list):
         raise SystemExit(f"Invalid state structure in {path}")
+
     data["sessions"] = [normalize_session(session) for session in data["sessions"]]
     data["cards"] = [normalize_card(card) for card in data["cards"]]
     data.setdefault("program", None)
@@ -218,11 +254,34 @@ def load_state(path: Path, allow_missing: bool = False) -> dict[str, Any]:
 
 
 def save_state(path: Path, data: dict[str, Any]) -> None:
+    """Save progress state dictionary to disk atomically.
+
+    Uses a temporary file in the same directory and replaces the target file via
+    atomic file system rename (os.replace). This prevents corrupted files in case
+    of power loss, disk write errors, or process interruptions (SIGINT).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    serialized = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    temp_file = path.with_suffix(f".tmp.{os.getpid()}")
+    try:
+        temp_file.write_text(serialized, encoding="utf-8")
+        temp_file.replace(path)
+    except Exception:
+        if temp_file.exists():
+            try:
+                temp_file.unlink()
+            except OSError:
+                pass
+        raise
 
 
 def calibration_label(initial_result: str, confidence: int) -> str:
+    """Label learner self-calibration based on pre-feedback confidence vs outcome.
+
+    - confident_wrong: learner reported high confidence (>=4) but was incorrect/partial.
+    - uncertain_correct: learner was correct but lacked confidence (<=2).
+    - calibrated: confidence aligned with actual performance.
+    """
     if initial_result in {"incorrect", "partial"} and confidence >= 4:
         return "confident_wrong"
     if initial_result == "correct" and confidence <= 2:
@@ -233,6 +292,7 @@ def calibration_label(initial_result: str, confidence: int) -> str:
 def initial_recall(
     outcome: str, initial_result: str, explain_back: int, transfer: int | None
 ) -> str:
+    """Derive initial recall quality rating from the session's performance metrics."""
     if initial_result == "incorrect":
         return "again"
     if initial_result == "partial" or outcome in {"heavily_assisted", "walked_through", "incomplete"}:
@@ -244,10 +304,12 @@ def initial_recall(
 
 
 def find_card(data: dict[str, Any], concept_id: str) -> dict[str, Any] | None:
+    """Find a card by its unique concept identifier."""
     return next((card for card in data["cards"] if card.get("id") == concept_id), None)
 
 
 def new_card(concept_id: str, topic: str, review_day: date) -> dict[str, Any]:
+    """Create a new concept card initialized with default baseline parameters."""
     return {
         "id": concept_id,
         "topic": topic,
@@ -265,6 +327,16 @@ def new_card(concept_id: str, topic: str, review_day: date) -> dict[str, Any]:
 def update_schedule(
     card: dict[str, Any], review_day: date, recall: str, confidence: int
 ) -> None:
+    """Update concept card stability, difficulty, and next due date using adaptive spaced review.
+
+    Heuristics:
+    - 'again': Resets/heavily shrinks stability, increases difficulty.
+      If learner was confident-wrong, resets stability to 0.5 and forces 1-day immediate re-test.
+    - 'hard': Modest stability growth (15-25%), small difficulty increase.
+    - 'good': Moderate stability growth (scaled by current difficulty and confidence).
+    - 'easy': Strong stability growth, reduces difficulty.
+    - Caps: Maximum interval is capped at 365 days; minimum stability is 0.5 days.
+    """
     stability = float(card.get("stability_days", 1.0))
     difficulty = float(card.get("difficulty", 5.0))
     calibration = "calibrated"
@@ -313,11 +385,13 @@ def update_schedule(
 
 
 def validate_score(name: str, value: int, minimum: int, maximum: int) -> None:
+    """Validate that an integer parameter falls within the required range."""
     if not minimum <= value <= maximum:
         raise SystemExit(f"--{name} must be between {minimum} and {maximum}")
 
 
 def last_session_day(data: dict[str, Any], concept_id: str) -> date | None:
+    """Find the date of the most recent recorded session for a concept."""
     days = [
         require_iso_date(session["date"], "session date")
         for session in data["sessions"]
@@ -327,6 +401,7 @@ def last_session_day(data: dict[str, Any], concept_id: str) -> date | None:
 
 
 def has_unaided_session(data: dict[str, Any], concept_id: str) -> bool:
+    """Check if at least one recorded session for this concept used an unaided policy."""
     return any(
         session.get("concept_id") == concept_id and session.get("assistance") in UNAIDED_POLICIES
         for session in data["sessions"]
@@ -336,6 +411,7 @@ def has_unaided_session(data: dict[str, Any], concept_id: str) -> bool:
 def validate_retention_gap(
     data: dict[str, Any], concept_id: str, phase: str, session_day: date
 ) -> None:
+    """Enforce minimum spacing between practice and retention checks."""
     gap = RETENTION_MIN_GAP_DAYS.get(phase)
     if gap is None:
         return
@@ -391,6 +467,7 @@ def validate_consistency(
 
 
 def cmd_init(args: argparse.Namespace) -> None:
+    """Initialize a new progress state file."""
     if args.state.exists() and not args.force:
         raise SystemExit(f"State file already exists: {args.state}; use --force to replace it")
     save_state(args.state, empty_state())
@@ -398,6 +475,7 @@ def cmd_init(args: argparse.Namespace) -> None:
 
 
 def cmd_record(args: argparse.Namespace) -> None:
+    """Record a practice session and update concept scheduling."""
     data = load_state(args.state, allow_missing=True)
     validate_score("hints", args.hints, 0, 6)
     validate_score("explain-back", args.explain_back, 0, 4)
@@ -465,6 +543,7 @@ def cmd_record(args: argparse.Namespace) -> None:
 
 
 def cmd_review(args: argparse.Namespace) -> None:
+    """Grade unaided recall for an existing concept and adapt its next due date."""
     data = load_state(args.state)
     validate_score("confidence", args.confidence, 1, 5)
     card = find_card(data, args.concept_id)
@@ -495,6 +574,7 @@ def cmd_review(args: argparse.Namespace) -> None:
 
 
 def cmd_due(args: argparse.Namespace) -> None:
+    """List concepts due for review on or before a given date."""
     data = load_state(args.state)
     today = args.on or date.today()
     cards = sorted(
@@ -513,7 +593,15 @@ def cmd_due(args: argparse.Namespace) -> None:
 
 
 def distribution(items: list[dict[str, Any]], field: str) -> str:
-    values = [int(item[field]) for item in items if item.get(field) is not None]
+    """Compute summary metrics (count, median, range) across integer fields."""
+    values: list[int] = []
+    for item in items:
+        val = item.get(field)
+        if val is not None:
+            try:
+                values.append(int(val))
+            except (ValueError, TypeError):
+                continue
     if not values:
         return "n=0"
     return (
@@ -523,6 +611,7 @@ def distribution(items: list[dict[str, Any]], field: str) -> str:
 
 
 def cmd_status(args: argparse.Namespace) -> None:
+    """Summarize overall progress, hint distributions, transfer, and calibration."""
     data = load_state(args.state)
     sessions = data["sessions"]
     cards = data["cards"]
@@ -582,6 +671,7 @@ def cmd_status(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the command-line argument parser for progress logging."""
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -653,6 +743,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """Entry point for progress CLI."""
     args = build_parser().parse_args()
     args.func(args)
 
