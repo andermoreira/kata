@@ -34,6 +34,23 @@ class PluginSkillLayoutTest(unittest.TestCase):
                 )
 
 
+class ManifestVersionTest(unittest.TestCase):
+    def test_every_manifest_declares_the_same_version(self) -> None:
+        def load(*parts: str) -> dict:
+            return json.loads(ROOT.joinpath(*parts).read_text(encoding="utf-8"))
+
+        claude = load(".claude-plugin", "plugin.json")
+        marketplace = load(".claude-plugin", "marketplace.json")
+        codex = load(".codex-plugin", "plugin.json")
+        versions = {
+            "claude plugin": claude["version"],
+            "claude marketplace": marketplace["version"],
+            "claude marketplace entry": marketplace["plugins"][0]["version"],
+            "codex plugin": codex["version"],
+        }
+        self.assertEqual(len(set(versions.values())), 1, versions)
+
+
 class PluginListingLimitsTest(unittest.TestCase):
     def test_codex_interface_fits_openai_directory_limits(self) -> None:
         manifest = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))

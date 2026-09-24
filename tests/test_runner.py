@@ -7,9 +7,12 @@ the suite stays runnable on any machine.
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -97,6 +100,43 @@ class PythonRunnerTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("status=timeout", result.stdout)
 
+    def spawn_background_child(self, detach_output: bool) -> str:
+        pid_file = self.root / "child.pid"
+        redirect = ", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL" if detach_output else ""
+        return (
+            "import pathlib, subprocess, sys\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']"
+            f"{redirect})\n"
+            f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))\n"
+            'print("PASS")\n'
+        )
+
+    def assert_child_is_gone(self) -> None:
+        pid = int((self.root / "child.pid").read_text())
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except (ProcessLookupError, PermissionError):
+                # PermissionError: the pid now belongs to another user's process.
+                return
+            time.sleep(0.05)
+        os.kill(pid, signal.SIGKILL)
+        self.fail(f"background child {pid} outlived the runner")
+
+    @unittest.skipUnless(os.name == "posix", "process groups are POSIX-only")
+    def test_background_child_holding_output_is_killed_on_timeout(self) -> None:
+        result = self.run_challenge(self.spawn_background_child(False), "--timeout", "1")
+        # Check the child first so a failed status assertion cannot leak it.
+        self.assert_child_is_gone()
+        self.assertIn("status=timeout", result.stdout)
+
+    @unittest.skipUnless(os.name == "posix", "process groups are POSIX-only")
+    def test_detached_background_child_is_killed_after_run(self) -> None:
+        result = self.run_challenge(self.spawn_background_child(True), "--timeout", "1")
+        # Check the child first so a failed status assertion cannot leak it.
+        self.assert_child_is_gone()
+        self.assertIn("status=passed", result.stdout)
 
     def test_support_files_are_copied_and_accessible(self) -> None:
         support_file = self.root / "helper.py"

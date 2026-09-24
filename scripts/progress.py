@@ -258,7 +258,9 @@ def save_state(path: Path, data: dict[str, Any]) -> None:
 
     Uses a temporary file in the same directory and replaces the target file via
     atomic file system rename (os.replace). This prevents corrupted files in case
-    of power loss, disk write errors, or process interruptions (SIGINT).
+    of disk write errors or process interruptions (SIGINT). It does not fsync, so it
+    does not guarantee durability across power loss; add os.fsync before replace if
+    that ever matters for a practice diary.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     serialized = json.dumps(data, ensure_ascii=False, indent=2) + "\n"

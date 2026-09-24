@@ -140,12 +140,15 @@ def resource_limiter(
 
 
 def _safe_kill_process(proc: subprocess.Popen[str]) -> None:
-    """Safely terminate a process and its process group without unhandled race conditions."""
+    """Safely terminate a process and its process group without unhandled race conditions.
+
+    The child calls setsid(), so its process group id equals its pid. Signal that id
+    directly: getpgid() fails once the leader has exited (macOS reports ESRCH for a
+    zombie), which would leave its background children running.
+    """
     if os.name == "posix":
         try:
-            pgid = os.getpgid(proc.pid)
-            os.killpg(pgid, signal.SIGKILL)
-            return
+            os.killpg(proc.pid, signal.SIGKILL)
         except OSError:
             pass
     try:
@@ -202,6 +205,8 @@ def run_process(
             raise
     except OSError as exc:
         return Result(status="error", phase="run", returncode=None, stdout="", stderr=str(exc))
+    # Reap background children that closed their output and outlived the test.
+    _safe_kill_process(proc)
 
     cpu_signals = {-getattr(signal, "SIGXCPU", signal.SIGTERM)}
     status = "passed" if proc.returncode == 0 else "failed"

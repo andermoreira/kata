@@ -55,8 +55,8 @@ flowchart LR
 - **No validated measurement of the method.** A session demonstrates performance on that task. Trends from a single learner are not causal evidence.
 - **No validated challenge bank.** Tasks are generated per session, so difficulty is not equated across attempts.
 - **No official FSRS scheduling.** The log uses a local interval heuristic with arbitrary growth constants. Only unaided sessions update stability.
-- **Resource bounding, not a multi-tenant security sandbox.** The runner enforces CPU timebox, file size caps (16 MB), memory limits, and runs in a disposable temp directory with process-group signal containment (`SIGKILL` on timeout). It is designed to guard against accidental infinite loops, memory leaks, and process hangs during practice, not untrusted hostile code.
-- **Crash-safe atomic persistence.** State modifications in `progress.py` use atomic file replacement to eliminate data corruption during interrupted writes.
+- **Resource bounding, not a multi-tenant security sandbox.** The runner enforces CPU timebox, file size caps (16 MB), memory limits, and runs in a disposable temp directory with process-group signal containment (on POSIX, `SIGKILL` to the whole group on timeout and after the run, so background children do not outlive it). It is designed to guard against accidental infinite loops, memory leaks, and process hangs during practice, not untrusted hostile code.
+- **Atomic persistence, not durable persistence.** `progress.py` writes state through atomic file replacement, so an interrupted process never leaves a half-written file. It does not fsync, so a power loss or OS crash can still lose the last write.
 
 The multiweek evaluation protocol and the four-role separation live in [references/deferred/](references/deferred/) as design input, not as procedures to run. [AUDIT.md](AUDIT.md) records the reviews that led to that demotion.
 
