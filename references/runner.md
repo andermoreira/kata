@@ -41,6 +41,8 @@ python scripts/runner.py run --language kotlin \
 
 Use repeatable `--support` arguments for additional source files. Use `--json` when another script consumes the result.
 
+Each compilation or test run captures up to 256 KiB per output stream and appends `[output truncated]` when more data was emitted. Non-UTF-8 bytes in captured output are replaced so the runner can still report the result.
+
 ## Test conventions
 
 Keep test harnesses dependency-free.
@@ -108,4 +110,4 @@ fun main() {
 | Java | `javac`, `java` |
 | Kotlin | `kotlinc`, `java` |
 
-If a toolchain is missing, state that limitation and use the project's existing test command if available. Do not silently replace deterministic execution with an LLM judgment.
+`doctor` checks that each executable can start and run its version command in the runner's environment. If a toolchain is unavailable, state that limitation and use the project's existing test command if available. Do not silently replace deterministic execution with an LLM judgment.

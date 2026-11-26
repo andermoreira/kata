@@ -5,8 +5,10 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
@@ -14,6 +16,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import progress  # noqa: E402
+
+PROGRESS = Path(progress.__file__).resolve()
 
 
 COHERENT = {
@@ -195,6 +199,16 @@ class RecordValidationTest(unittest.TestCase):
         self.assertEqual(card["reviews"], 0)
         self.assertEqual(card["due"], "2026-01-08")
 
+    def test_confident_partial_answer_is_due_the_next_day(self) -> None:
+        self.record(
+            date="2026-01-01", assistance="standard_unaided", outcome="incomplete",
+            initial_result="partial", confidence=5, hints=0,
+        )
+        saved = progress.load_state(self.state)
+        self.assertEqual(saved["sessions"][0]["confidence_calibration"], "confident_wrong")
+        self.assertEqual(saved["cards"][0]["calibration"], "confident_wrong")
+        self.assertEqual(saved["cards"][0]["due"], "2026-01-02")
+
     def test_review_without_unaided_session_is_rejected(self) -> None:
         self.record(date="2026-01-01")
         with self.assertRaises(SystemExit) as caught:
@@ -240,6 +254,92 @@ class RecordValidationTest(unittest.TestCase):
         card = json.loads(self.state.read_text(encoding="utf-8"))["cards"][0]
         self.assertEqual(card["last_recall"], "good")
         self.assertEqual(card["last_review"], "2026-01-08")
+
+    def test_review_cannot_predate_the_unaided_session(self) -> None:
+        self.record(
+            date="2026-01-08", assistance="standard_unaided", outcome="independent",
+            initial_result="correct", hints=0,
+        )
+        saved = self.state.read_bytes()
+        with self.assertRaisesRegex(SystemExit, "on or before"):
+            self.run_command(
+                [
+                    "review", "--state", str(self.state), "--concept-id", COHERENT["concept_id"],
+                    "--recall", "good", "--confidence", "4", "--on", "2026-01-07",
+                ]
+            )
+        self.assertEqual(self.state.read_bytes(), saved)
+
+    def test_backdated_unaided_session_cannot_move_the_schedule_backwards(self) -> None:
+        unaided = dict(
+            assistance="standard_unaided", outcome="independent", initial_result="correct", hints=0
+        )
+        self.record(date="2026-01-08", **unaided)
+        saved = self.state.read_bytes()
+        with self.assertRaisesRegex(SystemExit, "last scheduled review"):
+            self.record(date="2026-01-07", **unaided)
+        self.assertEqual(self.state.read_bytes(), saved)
+
+    def test_concurrent_records_preserve_both_sessions(self) -> None:
+        ready = self.state.with_name("writer-ready")
+        release = self.state.with_name("writer-release")
+        # Hold the first writer after its read and before its real save.
+        pause_writer = """
+import sys
+import time
+from pathlib import Path
+import progress
+
+ready, release = map(Path, sys.argv[1:3])
+save = progress.save_state
+
+def paused_save(*args):
+    ready.touch()
+    deadline = time.monotonic() + 8
+    while not release.exists():
+        if time.monotonic() >= deadline:
+            raise SystemExit("test did not release writer")
+        time.sleep(0.01)
+    save(*args)
+
+progress.save_state = paused_save
+sys.argv = [sys.argv[0], *sys.argv[3:]]
+progress.main()
+"""
+        command = ["record", "--state", str(self.state)]
+        with subprocess.Popen(
+            [
+                sys.executable, "-c", pause_writer, str(ready), str(release), *command,
+                *record_args(date="2026-01-01"),
+            ],
+            cwd=PROGRESS.parent, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        ) as first:
+            try:
+                deadline = time.monotonic() + 5
+                while not ready.exists() and first.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists(), "first writer did not reach save")
+                with subprocess.Popen(
+                    [
+                        sys.executable, str(PROGRESS), *command,
+                        *record_args(date="2026-01-02"),
+                    ],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                ) as second:
+                    try:
+                        second.communicate(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        pass  # The first writer still holds the state lock.
+                    finally:
+                        release.touch()
+                    _, error = second.communicate(timeout=5)
+                    self.assertEqual(second.returncode, 0, error)
+            finally:
+                release.touch()
+            _, error = first.communicate(timeout=5)
+            self.assertEqual(first.returncode, 0, error)
+        sessions = progress.load_state(self.state)["sessions"]
+        self.assertEqual([session["date"] for session in sessions], ["2026-01-01", "2026-01-02"])
 
 
 class StateMigrationTest(unittest.TestCase):
@@ -288,6 +388,24 @@ class StateMigrationTest(unittest.TestCase):
         with self.assertRaises(SystemExit) as caught:
             progress.load_state(self.state)
         self.assertIn("Session must be an object", str(caught.exception))
+
+    def test_v1_non_object_session_fails_cleanly_during_migration(self) -> None:
+        self.write({"schema_version": 1, "sessions": ["oops"]})
+        with self.assertRaisesRegex(SystemExit, "Session must be an object"):
+            progress.load_state(self.state)
+
+    def test_invalid_state_encoding_fails_cleanly(self) -> None:
+        self.state.write_bytes(b"\xff")
+        with self.assertRaisesRegex(SystemExit, "Could not read valid JSON"):
+            progress.load_state(self.state)
+
+    def test_invalid_scheduler_fields_fail_cleanly(self) -> None:
+        for field, value in (("stability_days", "soon"), ("difficulty", float("inf")), ("history", {})):
+            with self.subTest(field=field):
+                card = {"id": "c1", "due": "2026-01-01", field: value}
+                self.write({"schema_version": 4, "sessions": [], "cards": [card]})
+                with self.assertRaisesRegex(SystemExit, field):
+                    progress.load_state(self.state)
 
     def test_non_dict_root_fails_cleanly(self) -> None:
         self.state.write_text("[]", encoding="utf-8")

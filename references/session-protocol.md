@@ -29,9 +29,11 @@ Before meaningful help, require an artifact that exposes reasoning. Accept one o
 
 “Não sei”, “me dá a resposta”, “I don't know”, and “just tell me” are not attempts and are not a walkthrough request. Respond with a small observation task or concrete example to analyze, not the answer. A request to edit the learner's solution file is also not giving up: refuse the edit and wait for an attempt.
 
-A full walkthrough (hint level 6) requires an explicit request for the complete answer, such as `quero a resposta completa`. Then mark the result assisted.
+A full walkthrough (hint level 6) requires an explicit request for the complete answer, such as `quero a resposta completa`. If the task started unaided, close the unaided attempt and report any observable result before giving the walkthrough. Label the walkthrough as assisted.
 
 ## Coaching loop
+
+Use this loop during `coached` practice. During an unaided attempt, give only help allowed by the declared policy. Save any diagnosis, conceptual hint, or walkthrough for after scoring the attempt.
 
 For each learner attempt:
 
@@ -105,7 +107,7 @@ Give no conceptual hints during the first transfer attempt. Clarify only wording
 
 Report:
 
-- independent outcome;
+- observed outcome;
 - highest conceptual hint level;
 - confidence before feedback and any calibration mismatch;
 - explain-back score;
