@@ -178,6 +178,7 @@ python3 -m unittest discover -s tests
 ```
 
 Requires Python 3.9 or newer; verified on 3.9 and 3.14.
+CI uses Ubuntu 24.04 to keep testing Python 3.9. The move of `ubuntu-latest` to Ubuntu 26.04 made that interpreter unavailable through `setup-python`. [GitHub runner image notice](https://github.com/actions/runner-images/issues/14748)
 
 ## References and related work
 
