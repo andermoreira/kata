@@ -22,10 +22,10 @@ flowchart TD
   B --> C["Observable attempt"]
   C --> D{"Reasoning exposed?"}
   D -- No --> C
-  D -- Yes --> E["One hint-ladder rung"]
+  D -- Yes --> G{"Coached and blocked?"}
+  G -- Yes --> E["One hint-ladder rung"]
   E --> F["Another attempt"]
-  F --> G{"Still blocked?"}
-  G -- Yes --> E
+  F --> D
   G -- No --> H["Confidence 1-5"]
   H --> I["Tests or criteria; withheld tests last"]
   I --> J["Explain-back"]
@@ -56,7 +56,7 @@ flowchart LR
 - **No validated challenge bank.** Tasks are generated per session, so difficulty is not equated across attempts.
 - **No official FSRS scheduling.** The log uses a local interval heuristic with arbitrary growth constants. Only unaided sessions update stability.
 - **Resource bounding, not a multi-tenant security sandbox.** The runner enforces CPU timebox, file size caps (16 MB), memory limits, and runs in a disposable temp directory with process-group signal containment (on POSIX, `SIGKILL` to the whole group on timeout and after the run, so background children do not outlive it). It is designed to guard against accidental infinite loops, memory leaks, and process hangs during practice, not untrusted hostile code.
-- **Atomic persistence, not durable persistence.** `progress.py` writes state through atomic file replacement, so an interrupted process never leaves a half-written file. It does not fsync, so a power loss or OS crash can still lose the last write.
+- **Atomic persistence.** `progress.py` serializes writes with a sibling `<state-file>.lock` and replaces the JSON atomically. Keep the lock file in place while the diary is in use. A power loss or OS crash can still lose the last write because the script does not fsync.
 
 The multiweek evaluation protocol and the four-role separation live in [references/deferred/](references/deferred/) as design input, not as procedures to run. [AUDIT.md](AUDIT.md) records the reviews that led to that demotion.
 
@@ -165,7 +165,7 @@ python3 scripts/progress.py status --state .coding-reasoning/progress.json
 - `retention_7d` / `retention_21d` without a prior session for that concept, or recorded before the 7/21-day gap
 - the `independent` evaluator label
 
-Assisted sessions may create a concept card due in 7 days; they do not update stability. `review` requires a recorded unaided session for that concept. See [references/adaptive-review.md](references/adaptive-review.md).
+Assisted sessions may create a concept card due in 7 days. Only unaided sessions update stability. `review` requires a dated unaided session for that concept on or before the review date. See [references/adaptive-review.md](references/adaptive-review.md).
 
 `status` separates unaided from assisted sessions and reports medians, not a mastery percentage. Treat those numbers as a diary.
 
@@ -178,6 +178,7 @@ python3 -m unittest discover -s tests
 ```
 
 Requires Python 3.9 or newer; verified on 3.9 and 3.14.
+CI uses Ubuntu 24.04 to keep testing Python 3.9. The move of `ubuntu-latest` to Ubuntu 26.04 made that interpreter unavailable through `setup-python`. [GitHub runner image notice](https://github.com/actions/runner-images/issues/14748)
 
 ## References and related work
 

@@ -44,10 +44,10 @@ Do not let the learner choose the rating based only on how the review felt.
 
 - Only **unaided** sessions (`strict_unaided` or `standard_unaided`) update stability and difficulty.
 - Assisted sessions may create a concept card due in 7 days; they do not count as recall evidence.
-- `review` requires a recorded unaided session for that concept.
+- `review` requires a dated unaided session for that concept on or before the review date. Scheduling updates preserve chronological order for each card.
 - `retention_7d` and `retention_21d` require a prior session for the concept and at least 7 or 21 days since that last session.
 - Failed unaided recall reduces stability and increases difficulty.
-- Confident-wrong recall is scheduled for the next day.
+- A wrong or partially correct first answer at confidence 4–5 is scheduled for the next day in an unaided session. A review rated `again` at that confidence follows the same rule.
 - Hard recall grows the interval slowly.
 - Good and easy recall grow the interval increasingly as difficulty falls.
 - Low-confidence correct recall receives a smaller interval increase.

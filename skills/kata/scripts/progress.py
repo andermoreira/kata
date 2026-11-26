@@ -19,9 +19,11 @@ import math
 import os
 import re
 import statistics
+import tempfile
 from datetime import date, datetime, timedelta
+from functools import wraps
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 # Current state schema version.
@@ -111,11 +113,14 @@ def normalize_session(session: Any) -> dict[str, Any]:
     normalized.setdefault("phase", "practice")
     normalized.setdefault("assistance", "coached")
     evaluator = normalized.setdefault("evaluator", "coach")
-    if evaluator not in LEGACY_EVALUATORS:
-        raise SystemExit(f"Invalid evaluator in session: {evaluator}")
+    if not isinstance(evaluator, str) or evaluator not in LEGACY_EVALUATORS:
+        raise SystemExit("Invalid evaluator in session")
     context = normalized.setdefault("evaluator_context", "coaching")
-    if context not in LEGACY_EVALUATOR_CONTEXTS:
-        raise SystemExit(f"Invalid evaluator_context in session: {context}")
+    if not isinstance(context, str) or context not in LEGACY_EVALUATOR_CONTEXTS:
+        raise SystemExit("Invalid evaluator_context in session")
+    for field in ("capability", "phase", "assistance"):
+        if not isinstance(normalized[field], str):
+            raise SystemExit(f"Invalid {field} in session")
     normalized.setdefault("package_id", "")
     normalized.setdefault("policy_deviations", "")
     normalized.setdefault("transfer", None)
@@ -132,7 +137,9 @@ def normalize_card(card: Any) -> dict[str, Any]:
         raise SystemExit(f"Card must be an object, not {type(card).__name__}")
     for key in ("id", "due"):
         if not card.get(key):
-            raise SystemExit(f"Card is missing required field '{key}': {card}")
+            raise SystemExit(f"Card is missing required field '{key}'")
+    if not isinstance(card["id"], str):
+        raise SystemExit("Invalid id in card")
     require_iso_date(card["due"], "card due")
     normalized = dict(card)
     if normalized.get("last_review"):
@@ -145,6 +152,19 @@ def normalize_card(card: Any) -> dict[str, Any]:
     normalized.setdefault("lapses", 0)
     normalized.setdefault("last_confidence", None)
     normalized.setdefault("calibration", "unknown")
+    for field in ("stability_days", "difficulty", "reviews", "lapses"):
+        try:
+            if field in {"reviews", "lapses"}:
+                valid = int(normalized[field]) >= 0
+            else:
+                number = float(normalized[field])
+                valid = math.isfinite(number) and number > 0
+        except (ValueError, TypeError, OverflowError):
+            valid = False
+        if not valid:
+            raise SystemExit(f"Invalid {field} in card")
+    if "history" in normalized and not isinstance(normalized["history"], list):
+        raise SystemExit("Invalid history in card")
     return normalized
 
 
@@ -177,6 +197,8 @@ def migrate_v1(data: dict[str, Any]) -> dict[str, Any]:
             session.get("date", date.today().isoformat()), "session date"
         )
         reviews = session.get("reviews", [])
+        if not isinstance(reviews, list) or any(not isinstance(r, dict) for r in reviews):
+            raise SystemExit("Invalid reviews in legacy session")
         pending = []
         for review in reviews:
             if review.get("completed") or not review.get("due"):
@@ -223,34 +245,69 @@ def load_state(path: Path, allow_missing: bool = False) -> dict[str, Any]:
     Validates that the file exists, contains valid JSON, has a dictionary root,
     and applies versioned schema migrations if necessary.
     """
-    if not path.exists():
-        if allow_missing:
-            return empty_state()
-        raise SystemExit(f"State file not found: {path}")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except FileNotFoundError as exc:
+        if allow_missing:
+            return empty_state()
+        raise SystemExit(f"State file not found: {path}") from exc
+    except (OSError, UnicodeError, ValueError) as exc:
         raise SystemExit(f"Could not read valid JSON from {path}: {exc}") from exc
 
     if not isinstance(data, dict):
         raise SystemExit(f"Invalid state structure in {path}: root must be a JSON object")
 
-    if data.get("schema_version") == 1 and isinstance(data.get("sessions"), list):
-        data = migrate_v1(data)
-    elif data.get("schema_version") == 2 and isinstance(data.get("sessions"), list):
-        data = migrate_v2(data)
-    elif data.get("schema_version") == 3 and isinstance(data.get("sessions"), list):
-        data = migrate_v3(data)
-    elif data.get("schema_version") != SCHEMA_VERSION:
+    version = data.get("schema_version")
+    if type(version) is not int or version not in (1, 2, 3, SCHEMA_VERSION):
         raise SystemExit(f"Unsupported state schema in {path}")
-
-    if not isinstance(data.get("sessions"), list) or not isinstance(data.get("cards"), list):
-        raise SystemExit(f"Invalid state structure in {path}")
-
+    if not isinstance(data.get("sessions"), list):
+        raise SystemExit(f"Invalid state structure in {path}: sessions must be an array")
     data["sessions"] = [normalize_session(session) for session in data["sessions"]]
+    if version == 1:
+        data = migrate_v1(data)
+    elif version == 2:
+        data = migrate_v2(data)
+    elif version == 3:
+        data = migrate_v3(data)
+
+    if not isinstance(data.get("cards"), list):
+        raise SystemExit(f"Invalid state structure in {path}: cards must be an array")
+
     data["cards"] = [normalize_card(card) for card in data["cards"]]
-    data.setdefault("program", None)
+    program = data.setdefault("program", None)
+    if program is not None and not isinstance(program, dict):
+        raise SystemExit("Invalid program in state")
     return data
+
+
+def state_writer(command: Callable[[argparse.Namespace], None]) -> Callable[[argparse.Namespace], None]:
+    """Serialize the complete read-modify-replace operation for each state file."""
+    @wraps(command)
+    def write(args: argparse.Namespace) -> None:
+        try:
+            path = args.state.resolve() if args.state.is_symlink() else args.state
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # Keep a separate, stable lock file. Replacing the state changes its inode.
+            lock_path = path.with_name(f"{path.name}.lock")
+            with lock_path.open("a+b") as lock:
+                if os.name == "nt":
+                    import msvcrt
+
+                    lock.seek(0)
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                try:
+                    command(argparse.Namespace(**{**vars(args), "state": path}))
+                finally:
+                    if os.name == "nt":
+                        msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError as exc:
+            raise SystemExit(f"Could not update state {args.state}: {exc.strerror or exc}") from exc
+
+    return write
 
 
 def save_state(path: Path, data: dict[str, Any]) -> None:
@@ -264,17 +321,19 @@ def save_state(path: Path, data: dict[str, Any]) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     serialized = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
-    temp_file = path.with_suffix(f".tmp.{os.getpid()}")
+    temp_file = None
     try:
-        temp_file.write_text(serialized, encoding="utf-8")
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.tmp.",
+            delete=False,
+        ) as temporary:
+            temp_file = Path(temporary.name)
+            temporary.write(serialized)
         temp_file.replace(path)
-    except Exception:
-        if temp_file.exists():
-            try:
-                temp_file.unlink()
-            except OSError:
-                pass
-        raise
+        temp_file = None
+    finally:
+        if temp_file is not None:
+            temp_file.unlink(missing_ok=True)
 
 
 def calibration_label(initial_result: str, confidence: int) -> str:
@@ -327,7 +386,8 @@ def new_card(concept_id: str, topic: str, review_day: date) -> dict[str, Any]:
 
 
 def update_schedule(
-    card: dict[str, Any], review_day: date, recall: str, confidence: int
+    card: dict[str, Any], review_day: date, recall: str, confidence: int,
+    *, confident_wrong: bool = False,
 ) -> None:
     """Update concept card stability, difficulty, and next due date using adaptive spaced review.
 
@@ -339,6 +399,10 @@ def update_schedule(
     - 'easy': Strong stability growth, reduces difficulty.
     - Caps: Maximum interval is capped at 365 days; minimum stability is 0.5 days.
     """
+    previous = card.get("last_review")
+    if previous and review_day < require_iso_date(previous, "card last_review"):
+        raise SystemExit("Schedule update cannot predate the last scheduled review")
+
     stability = float(card.get("stability_days", 1.0))
     difficulty = float(card.get("difficulty", 5.0))
     calibration = "calibrated"
@@ -347,10 +411,6 @@ def update_schedule(
         stability = max(0.5, stability * 0.35)
         difficulty = min(10.0, difficulty + 1.0)
         card["lapses"] = int(card.get("lapses", 0)) + 1
-        if confidence >= 4:
-            stability = 0.5
-            difficulty = min(10.0, difficulty + 0.8)
-            calibration = "confident_wrong"
     elif recall == "hard":
         growth = 1.15 if confidence <= 2 else 1.25
         stability = max(1.0, stability * growth)
@@ -371,7 +431,12 @@ def update_schedule(
     else:
         raise SystemExit(f"Invalid recall rating: {recall}")
 
-    interval = 1 if calibration == "confident_wrong" else max(1, min(365, math.ceil(stability)))
+    if confident_wrong or (recall == "again" and confidence >= 4):
+        stability = 0.5
+        difficulty = min(10.0, difficulty + 0.8)
+        calibration = "confident_wrong"
+
+    interval = max(1, math.ceil(min(365, stability)))
     card.update(
         {
             "stability_days": round(stability, 2),
@@ -402,10 +467,13 @@ def last_session_day(data: dict[str, Any], concept_id: str) -> date | None:
     return max(days) if days else None
 
 
-def has_unaided_session(data: dict[str, Any], concept_id: str) -> bool:
-    """Check if at least one recorded session for this concept used an unaided policy."""
+def has_unaided_session(data: dict[str, Any], concept_id: str, as_of: date) -> bool:
+    """Check whether the concept has unaided evidence at the time of review."""
     return any(
-        session.get("concept_id") == concept_id and session.get("assistance") in UNAIDED_POLICIES
+        session.get("concept_id") == concept_id
+        and session.get("assistance") in UNAIDED_POLICIES
+        and session.get("date")
+        and require_iso_date(session["date"], "session date") <= as_of
         for session in data["sessions"]
     )
 
@@ -468,6 +536,7 @@ def validate_consistency(
         )
 
 
+@state_writer
 def cmd_init(args: argparse.Namespace) -> None:
     """Initialize a new progress state file."""
     if args.state.exists() and not args.force:
@@ -476,6 +545,7 @@ def cmd_init(args: argparse.Namespace) -> None:
     print(f"Initialized {args.state}")
 
 
+@state_writer
 def cmd_record(args: argparse.Namespace) -> None:
     """Record a practice session and update concept scheduling."""
     data = load_state(args.state, allow_missing=True)
@@ -499,6 +569,7 @@ def cmd_record(args: argparse.Namespace) -> None:
     concept_id = args.concept_id or slugify(args.topic)
     validate_retention_gap(data, concept_id, args.phase, session_day)
     recall = initial_recall(args.outcome, args.initial_result, args.explain_back, args.transfer)
+    calibration = calibration_label(args.initial_result, args.confidence)
     session = {
         "date": session_day.isoformat(),
         "concept_id": concept_id,
@@ -514,7 +585,7 @@ def cmd_record(args: argparse.Namespace) -> None:
         "policy_deviations": args.policy_deviations or "",
         "initial_result": args.initial_result,
         "confidence_before_feedback": args.confidence,
-        "confidence_calibration": calibration_label(args.initial_result, args.confidence),
+        "confidence_calibration": calibration,
         "outcome": args.outcome,
         "highest_hint": args.hints,
         "explain_back": args.explain_back,
@@ -533,7 +604,10 @@ def cmd_record(args: argparse.Namespace) -> None:
         data["cards"].append(card)
     scheduled = False
     if args.assistance in UNAIDED_POLICIES:
-        update_schedule(card, session_day, recall, args.confidence)
+        update_schedule(
+            card, session_day, recall, args.confidence,
+            confident_wrong=calibration == "confident_wrong",
+        )
         scheduled = True
     save_state(args.state, data)
     due_note = f" next_due={card['due']}" if card.get("due") else ""
@@ -544,6 +618,7 @@ def cmd_record(args: argparse.Namespace) -> None:
     )
 
 
+@state_writer
 def cmd_review(args: argparse.Namespace) -> None:
     """Grade unaided recall for an existing concept and adapt its next due date."""
     data = load_state(args.state)
@@ -551,12 +626,11 @@ def cmd_review(args: argparse.Namespace) -> None:
     card = find_card(data, args.concept_id)
     if card is None:
         raise SystemExit(f"Unknown concept id: {args.concept_id}")
-    if not has_unaided_session(data, args.concept_id):
-        raise SystemExit(
-            "review requires a recorded unaided session for this concept; "
-            "do not grade recall from assisted practice alone"
-        )
     review_day = args.on or date.today()
+    if not has_unaided_session(data, args.concept_id, review_day):
+        raise SystemExit(
+            "review requires a recorded unaided session for this concept on or before the review date"
+        )
     previous_due = card["due"]
     update_schedule(card, review_day, args.recall, args.confidence)
     card.setdefault("history", []).append(
@@ -602,7 +676,7 @@ def distribution(items: list[dict[str, Any]], field: str) -> str:
         if val is not None:
             try:
                 values.append(int(val))
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, OverflowError):
                 continue
     if not values:
         return "n=0"
@@ -622,8 +696,9 @@ def cmd_status(args: argparse.Namespace) -> None:
     if data.get("program"):
         program = data["program"]
         print(
-            f"Program: {program['objective']} / {program['duration_weeks']} weeks / "
-            f"baseline={program['baseline_policy']}"
+            f"Program: {program.get('objective', 'unknown')} / "
+            f"{program.get('duration_weeks', 'unknown')} weeks / "
+            f"baseline={program.get('baseline_policy', 'unknown')}"
         )
     if sessions:
         # rubric.md forbids pooling assisted and unaided attempts into one number.

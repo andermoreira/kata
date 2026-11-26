@@ -64,7 +64,7 @@ Follow the detailed protocol in [references/session-protocol.md](references/sess
 2. Ask the learner to restate the problem, list assumptions or invariants, and propose a plan before coding.
 3. Wait for an observable attempt. Do not write the solution file or implement the core answer for them.
 4. Diagnose the reasoning gap from their attempt.
-5. Give only the next rung of the hint ladder in the protocol.
+5. Under `coached`, give only the next rung of the hint ladder when the learner is blocked. During an unaided attempt, withhold conceptual feedback until the attempt is scored.
 6. Ask for confidence from 1–5 before revealing correctness or running withheld tests.
 7. Test the result objectively. Separate public examples from withheld tests when practical.
 8. Require an explain-back: why it works, complexity/tradeoffs, and where it can fail.

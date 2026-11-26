@@ -2,6 +2,8 @@
 
 Score evidence of unaided reasoning, not polish produced with assistance.
 
+Score an attempt only when you can inspect the learner's artifact and the evidence about how it was produced. When you have only the learner's retrospective account, summarize it as self-reported and leave the score unrecorded.
+
 ## Outcome labels
 
 - **Independent**: correct with no conceptual hint at all.
@@ -41,7 +43,7 @@ A level-1 diagnostic question is a conceptual hint, so it costs the independent 
 Use this compact template:
 
 ```text
-Resultado independente: independent | lightly_assisted | heavily_assisted | walked_through | incomplete
+Resultado observado: independent | lightly_assisted | heavily_assisted | walked_through | incomplete
 Maior pista conceitual: 0–6
 Confiança antes do feedback: 1–5
 Calibração: calibrated | confident_wrong | uncertain_correct

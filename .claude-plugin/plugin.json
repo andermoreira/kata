@@ -2,7 +2,7 @@
   "name": "kata",
   "displayName": "Kata",
   "description": "Coaches programming reasoning: attempt first, progressive hints, unaided transfer. Not a model trainer.",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "author": {
     "name": "Anderson Alves",
     "url": "https://github.com/andersonmalves"

@@ -30,7 +30,9 @@ class PythonRunnerTest(unittest.TestCase):
         self.root = Path(self.workspace.name)
         (self.root / "solution.py").write_text(SOLUTION, encoding="utf-8")
 
-    def run_challenge(self, test_source: str, *extra: str) -> subprocess.CompletedProcess:
+    def run_challenge(
+        self, test_source: str, *extra: str, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess:
         test_file = self.root / "challenge_test.py"
         test_file.write_text(test_source, encoding="utf-8")
         return subprocess.run(
@@ -51,6 +53,8 @@ class PythonRunnerTest(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
+            timeout=15,
+            env=env,
         )
 
     def test_passing_tests_exit_zero(self) -> None:
@@ -68,6 +72,55 @@ class PythonRunnerTest(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(payload["status"], "passed")
         self.assertEqual(payload["phase"], "run")
+
+    def test_invalid_utf8_preserves_test_result(self) -> None:
+        result = self.run_challenge(
+            "import os\nos.write(1, b'before\\xffafter\\n')\n", "--json"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["stdout"], "before\ufffdafter\n")
+
+    def test_json_output_works_with_an_ascii_console(self) -> None:
+        result = self.run_challenge(
+            "import os\nos.write(1, b'\\xc3\\xa9\\n')\n",
+            "--json", env={**os.environ, "PYTHONIOENCODING": "ascii"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["stdout"], "\u00e9\n")
+
+    def test_noisy_process_is_drained_with_bounded_output(self) -> None:
+        source = (
+            "import os\n"
+            "for _ in range(64):\n"
+            "    os.write(1, b'x' * 16384)\n"
+            "    os.write(2, b'y' * 16384)\n"
+        )
+        result = self.run_challenge(source, "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        for field, prefix in (("stdout", "x"), ("stderr", "y")):
+            with self.subTest(field=field):
+                self.assertTrue(payload[field].startswith(prefix * 64))
+                self.assertLess(len(payload[field]), 300_000)
+                self.assertIn("[output truncated]", payload[field])
+
+    @unittest.skipUnless(os.name == "posix", "symlink creation requires privileges on Windows")
+    def test_symlinked_test_preserves_supplied_filename(self) -> None:
+        target = self.root / "source.py"
+        target.write_text(PASSING_TEST, encoding="utf-8")
+        alias = self.root / "test_alias.py"
+        alias.symlink_to(target)
+        result = self.run_challenge("", "--tests", str(alias), "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["stdout"], "PASS\n")
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signals are required")
+    def test_test_process_stopped_by_sigterm_is_a_failure(self) -> None:
+        result = self.run_challenge(
+            "import os, signal\nos.kill(os.getpid(), signal.SIGTERM)\n", "--json"
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(json.loads(result.stdout)["status"], "failed")
 
     def test_cpu_bound_hang_is_stopped(self) -> None:
         result = self.run_challenge("while True:\n    pass\n")
@@ -90,6 +143,16 @@ class PythonRunnerTest(unittest.TestCase):
         result = self.run_challenge("import time\ntime.sleep(30)\n", "--timeout", "1")
         self.assertEqual(result.returncode, 1)
         self.assertIn("status=timeout", result.stdout)
+
+    def test_timeout_preserves_output_and_explains_why_it_stopped(self) -> None:
+        result = self.run_challenge(
+            "import sys, time\nprint('checkpoint', file=sys.stderr, flush=True)\ntime.sleep(30)\n",
+            "--timeout", "1", "--json",
+        )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "timeout")
+        self.assertIn("checkpoint", payload["stderr"])
+        self.assertIn("Timed out after 1 second", payload["stderr"])
 
     def test_child_process_timeout_is_stopped(self) -> None:
         child_test = (
@@ -214,6 +277,22 @@ class ArgumentValidationTest(unittest.TestCase):
         for language in ("python", "typescript", "java", "kotlin"):
             self.assertIn(language, result.stdout)
 
+    @unittest.skipUnless(os.name == "posix", "executable shell fixtures require POSIX")
+    def test_doctor_rejects_an_executable_that_cannot_start_its_toolchain(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            tools = Path(temporary)
+            for name, status in (("java", 1), ("javac", 0)):
+                executable = tools / name
+                executable.write_text(f"#!/bin/sh\nexit {status}\n", encoding="utf-8")
+                executable.chmod(0o755)
+            result = subprocess.run(
+                [sys.executable, str(RUNNER), "doctor"],
+                env={**os.environ, "PATH": str(tools)},
+                capture_output=True, text=True, timeout=15,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("java: unavailable", result.stdout)
+        self.assertIn("version check failed", result.stdout)
 
 if __name__ == "__main__":
     unittest.main()

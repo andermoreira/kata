@@ -25,7 +25,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from dataclasses import asdict, dataclass
+from io import BufferedReader
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -40,6 +43,7 @@ LANGUAGES: dict[str, dict[str, set[str] | tuple[str, ...]]] = {
 
 # Accepted CLI aliases for user convenience.
 ALIASES: dict[str, str] = {"py": "python", "ts": "typescript", "kt": "kotlin"}
+OUTPUT_LIMIT_BYTES = 256 * 1024
 
 
 @dataclass
@@ -63,7 +67,8 @@ def normalize_language(value: str) -> str:
 
 def find_tool(name: str) -> str | None:
     """Locate an executable binary on system PATH."""
-    return shutil.which(name)
+    path = shutil.which(name)
+    return os.path.abspath(path) if path else None
 
 
 def clean_environment(workspace: Path) -> dict[str, str]:
@@ -112,12 +117,6 @@ def resource_limiter(
         return None
 
     def limit() -> None:
-        try:
-            # Create a new process group session so child processes can be terminated together.
-            os.setsid()
-        except OSError:
-            pass
-
         def apply(kind: int, soft: int, hard: int) -> None:
             try:
                 _, current_hard = resource.getrlimit(kind)
@@ -139,10 +138,10 @@ def resource_limiter(
     return limit
 
 
-def _safe_kill_process(proc: subprocess.Popen[str]) -> None:
+def _safe_kill_process(proc: subprocess.Popen[bytes]) -> None:
     """Safely terminate a process and its process group without unhandled race conditions.
 
-    The child calls setsid(), so its process group id equals its pid. Signal that id
+    The child starts a new session, so its process group id equals its pid. Signal that id
     directly: getpgid() fails once the leader has exited (macOS reports ESRCH for a
     zombie), which would leave its background children running.
     """
@@ -157,6 +156,26 @@ def _safe_kill_process(proc: subprocess.Popen[str]) -> None:
         pass
 
 
+def capture_output(stream: BufferedReader, output: bytearray, errors: list[OSError]) -> None:
+    """Drain a pipe, retaining only a bounded prefix for diagnostics."""
+    try:
+        with stream:
+            while chunk := stream.read1(64 * 1024):
+                remaining = OUTPUT_LIMIT_BYTES + 1 - len(output)
+                output.extend(chunk[:remaining])
+    except OSError as exc:
+        errors.append(exc)
+
+
+def decode_output(output: bytearray) -> str:
+    """Decode the bounded prefix and mark output lost to truncation."""
+    text = output[:OUTPUT_LIMIT_BYTES].decode("utf-8", errors="replace")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if len(output) > OUTPUT_LIMIT_BYTES:
+        text += "\n[output truncated]\n"
+    return text
+
+
 def run_process(
     command: Sequence[str],
     workspace: Path,
@@ -166,11 +185,7 @@ def run_process(
     limit_address_space: bool = False,
 ) -> Result:
     """Execute a command in the workspace directory with timeout and resource limits."""
-    preexec = (
-        resource_limiter(timeout, memory_mb, limit_address_space)
-        if apply_limits
-        else (getattr(os, "setsid", None) if os.name == "posix" else None)
-    )
+    preexec = resource_limiter(timeout, memory_mb, limit_address_space) if apply_limits else None
     try:
         proc = subprocess.Popen(
             list(command),
@@ -178,47 +193,54 @@ def run_process(
             env=clean_environment(workspace),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
             preexec_fn=preexec,
+            start_new_session=os.name == "posix",
         )
-        try:
-            stdout, stderr = proc.communicate(timeout=timeout + 1)
-        except subprocess.TimeoutExpired:
-            _safe_kill_process(proc)
-            try:
-                stdout, stderr = proc.communicate(timeout=1)
-            except (subprocess.TimeoutExpired, ValueError, OSError):
-                stdout, stderr = "", ""
-            return Result(
-                status="timeout",
-                phase="run",
-                returncode=None,
-                stdout=stdout or "",
-                stderr=stderr or f"Timed out after {timeout} seconds",
-            )
-        except Exception:
-            _safe_kill_process(proc)
-            try:
-                proc.wait(timeout=1)
-            except (subprocess.TimeoutExpired, OSError):
-                pass
-            raise
     except OSError as exc:
         return Result(status="error", phase="run", returncode=None, stdout="", stderr=str(exc))
-    # Reap background children that closed their output and outlived the test.
-    _safe_kill_process(proc)
 
-    cpu_signals = {-getattr(signal, "SIGXCPU", signal.SIGTERM)}
-    status = "passed" if proc.returncode == 0 else "failed"
-    if proc.returncode in cpu_signals:
+    stdout, stderr = bytearray(), bytearray()
+    errors: list[OSError] = []
+    readers: list[threading.Thread] = []
+    timed_out = False
+    deadline = time.monotonic() + timeout + 1
+    try:
+        for stream, output in ((proc.stdout, stdout), (proc.stderr, stderr)):
+            reader = threading.Thread(target=capture_output, args=(stream, output, errors), daemon=True)
+            reader.start()
+            readers.append(reader)
+        for reader in readers:
+            reader.join(max(0, deadline - time.monotonic()))
+            if reader.is_alive():
+                raise subprocess.TimeoutExpired(command, timeout)
+        proc.wait(timeout=max(0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    finally:
+        # Also kill background children that closed their output before the test ended.
+        _safe_kill_process(proc)
+        cleanup_deadline = time.monotonic() + 1
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+        for reader in readers:
+            reader.join(max(0, cleanup_deadline - time.monotonic()))
+
+    stdout_text, stderr_text = decode_output(stdout), decode_output(stderr)
+    returncode = proc.returncode
+    if timed_out:
+        units = "second" if timeout == 1 else "seconds"
+        stderr_text = f"{stderr_text.rstrip()}\nTimed out after {timeout} {units}".lstrip("\n")
+        status, returncode = "timeout", None
+    elif apply_limits and returncode is not None and getattr(signal, "SIGXCPU", None) == -returncode:
         status = "timeout"
-    return Result(
-        status=status,
-        phase="run",
-        returncode=proc.returncode,
-        stdout=stdout,
-        stderr=stderr,
-    )
+    elif errors:
+        status = "error"
+        stderr_text += f"Could not read process output: {errors[0]}\n"
+    else:
+        status = "passed" if returncode == 0 else "failed"
+    return Result(status, "run", returncode, stdout_text, stderr_text)
 
 
 def compile_sources(command: Sequence[str], workspace: Path, timeout: int) -> Result:
@@ -235,7 +257,6 @@ def copy_sources(paths: Sequence[Path], workspace: Path, extensions: set[str]) -
     copied: list[Path] = []
     names: set[str] = set()
     for source in paths:
-        source = source.resolve()
         if not source.is_file():
             raise SystemExit(f"Source file not found: {source}")
         if source.suffix.lower() not in extensions:
@@ -354,7 +375,7 @@ def sanitize(result: Result, workspace: Path) -> Result:
 def emit(result: Result, as_json: bool) -> None:
     """Print the execution result in human-readable or JSON format."""
     if as_json:
-        print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
+        print(json.dumps(asdict(result), sort_keys=True))
         return
     print(f"status={result.status} phase={result.phase} returncode={result.returncode}")
     if result.stdout:
@@ -367,15 +388,28 @@ def emit(result: Result, as_json: bool) -> None:
 
 def cmd_doctor(_: argparse.Namespace) -> None:
     """Check and display the availability of required language toolchains."""
-    for language, config in LANGUAGES.items():
-        tools = (
-            {"python": sys.executable}
-            if language == "python"
-            else {name: find_tool(name) for name in config["tools"]}
-        )
-        ready = all(tools.values())
-        locations = ", ".join(f"{name}={path or 'missing'}" for name, path in tools.items())
-        print(f"{language}: {'ready' if ready else 'unavailable'} ({locations})")
+    checks: dict[str, tuple[bool, str]] = {}
+    with tempfile.TemporaryDirectory(prefix="coding-reasoning-") as temporary:
+        workspace = Path(temporary)
+        for language, config in LANGUAGES.items():
+            for name in config["tools"]:
+                if name in checks:
+                    continue
+                path = sys.executable if name == "python3" else find_tool(name)
+                if not path:
+                    checks[name] = (False, "missing")
+                    continue
+                flag = "-version" if name in {"java", "javac", "kotlinc"} else "--version"
+                result = run_process([path, flag], workspace, 4, 0, apply_limits=False)
+                ready = result.status == "passed"
+                label = path if ready else f"{path} (version check failed: {result.status})"
+                checks[name] = (ready, label)
+            ready = all(checks[name][0] for name in config["tools"])
+            locations = ", ".join(
+                f"{'python' if name == 'python3' else name}={checks[name][1]}"
+                for name in config["tools"]
+            )
+            print(f"{language}: {'ready' if ready else 'unavailable'} ({locations})")
 
 
 def cmd_run(args: argparse.Namespace) -> None:
